@@ -10,6 +10,11 @@
 3. **没有安全顺序时卡在哪**：返回能安全走到的**最大前缀**，并逐个说明剩余
    每个区若紧接着发布会断在哪条解析链上，区分**缺记录**与**成环**。
 
+另带一个**变更暂存库**（见下文「暂存库 API」）：值班员读取当前暂存快照、
+按记录名提交改前/改后整组记录的变更单；两张单即使改的是不同记录，也可能
+截断同一条 CNAME 链，因此每张单都要在「改前一致 + 区记录校验 + 必保域名
+可解析」全部通过后才整单落库。
+
 ## 推演模型
 
 * 每个区只有两个状态：整区旧记录、整区新记录。一次发布 = 一个区整区切换，
@@ -39,7 +44,10 @@ curl -s http://localhost:8000/healthz
 OpenAPI 文档：<http://localhost:8000/docs>
 
 镜像以非 root 用户运行，容器只读挂载根文件系统（`read_only: true`、
-`no-new-privileges`），并带 `HEALTHCHECK`。
+`no-new-privileges`），并带 `HEALTHCHECK`。暂存库快照持久化在命名卷
+`staging-data`（容器内 `/data`）里：首次启动从镜像内置样例
+`app/seed/staging-seed.json` 载入区记录和必保域名并落盘，之后重启、
+重建容器都沿用卷里已保存的快照。
 
 ### 不用 Docker 时
 
@@ -54,7 +62,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### `GET /healthz`
 
 ```json
-{"status": "ok", "version": "1.0.0"}
+{"status": "ok", "version": "1.1.0"}
 ```
 
 ### `POST /plan`
@@ -169,6 +177,128 @@ curl -s -X POST http://localhost:8000/plan \
 python examples/demo.py
 ```
 
+## 暂存库 API
+
+暂存库保存一份**当前快照**：各区现有 A/CNAME 记录 + 必保域名 + 单调递增的
+`revision`。首次启动从本地样例（`app/seed/staging-seed.json`，可用
+`STAGING_SEED_PATH` 覆盖）载入并立即落盘；之后重启沿用已保存的快照
+（`STAGING_SNAPSHOT_PATH`，compose 里指向命名卷 `/data`）。
+
+变更单按**记录名**提交改前和改后的**整组** A/CNAME 记录。落库规则（全部
+在单把锁内完成，并发提交同样遵守）：
+
+1. 每条变更的 `before` 必须与暂存库中该名的当前记录**完全一致**（忽略顺序，
+   含 TTL）；空 `before` 表示断言该名尚不存在。
+2. 整张单合入最新快照后，每个区须通过与 `/plan` 相同的区记录校验。
+3. 合入后的快照里，所有必保域名必须都能（无缓存）解析到 IPv4。
+4. 三条都过才整单落盘（临时文件 + rename 原子替换）；任一不过则整单拒收，
+   快照一个字节都不动。
+
+### `GET /staging/snapshot`
+
+返回当前快照及必保域名的实时解析状态：
+
+```bash
+curl -s http://localhost:8000/staging/snapshot | python -m json.tool
+```
+
+```json
+{
+  "revision": 0,
+  "zones": [
+    {"name": "a.example.com", "records": [
+      {"name": "www.a.example.com", "type": "CNAME", "value": "svc.b.example.com", "ttl": 60}]},
+    {"name": "b.example.com", "records": [
+      {"name": "svc.b.example.com", "type": "A", "value": "10.20.1.10", "ttl": 60}]}
+  ],
+  "required_domains": ["www.a.example.com"],
+  "all_required_resolvable": true,
+  "required_resolution": {"www.a.example.com": ["10.20.1.10"]},
+  "unresolved": []
+}
+```
+
+### `POST /staging/tickets`
+
+请求体：`ticket_id`（可选，外部工单号，原样回显）+ `changes`（每条含
+`name` / `before` / `after`；`before`、`after` 内记录的属主名必须等于
+`name`；`after` 为空表示删除该名）。成功返回 `200` 与最新快照。
+
+拒收时整单不落库，并按原因返回：
+
+| HTTP | reason | 说明 |
+| --- | --- | --- |
+| 409 | `before_mismatch` | 改前记录与暂存库不一致，`conflicting_names` + `conflicts` 给出冲突记录名及双方记录 |
+| 409 | `required_domains_unresolvable` | 合入后必保域名解析不到 IPv4，`fault_chains` 给出故障链（与 /plan 同格式） |
+| 422 | `zone_validation_failed` | 合入后违反区记录校验（同名 A+CNAME、顶点 CNAME 等），`errors` 逐条列出 |
+| 422 | `name_outside_zones` | 变更的记录名不属于任何暂存区 |
+| 422 | （请求校验） | 变更单本身不合法（名单重复、记录名与变更名不符等） |
+
+### 演练：四张单跑一遍
+
+仓库自带四张可直接提交的变更单，演示上述每条规则（按顺序执行）：
+
+```bash
+# 0) 看当前快照（首次启动已从样例载入）
+curl -s http://localhost:8000/staging/snapshot | python -m json.tool
+
+# 1) 直接删掉 svc.b 的 A 记录：www.a 的 CNAME 链会断 → 409 + 故障链，不落库
+curl -s -X POST http://localhost:8000/staging/tickets \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/ticket-04-remove-svc.json | python -m json.tool
+
+# 2) 先加新目标 svc2.b → 200，revision 变 1
+curl -s -X POST http://localhost:8000/staging/tickets \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/ticket-01-add-svc2.json | python -m json.tool
+
+# 3) 再把 www.a 的 CNAME 切到 svc2.b → 200，revision 变 2
+curl -s -X POST http://localhost:8000/staging/tickets \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/ticket-02-flip-www.json | python -m json.tool
+
+# 4) 另一张单仍按旧的改前记录（CNAME svc.b）提交 → 409 + 冲突记录名，不落库
+curl -s -X POST http://localhost:8000/staging/tickets \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/ticket-03-stale-flip.json | python -m json.tool
+
+# 重启容器后快照仍在（revision 仍为 2）
+docker compose restart && sleep 3
+curl -s http://localhost:8000/staging/snapshot | python -m json.tool
+```
+
+第 1 步的拒收响应节选：
+
+```json
+{
+  "detail": {
+    "status": "rejected",
+    "reason": "required_domains_unresolvable",
+    "fault_chains": [
+      {"domain": "www.a.example.com", "category": "missing_record",
+       "chain": "www.a.example.com --CNAME--> svc.b.example.com => 无记录（NXDOMAIN）"}
+    ]
+  }
+}
+```
+
+第 4 步的拒收响应节选：
+
+```json
+{
+  "detail": {
+    "status": "rejected",
+    "reason": "before_mismatch",
+    "conflicting_names": ["www.a.example.com"],
+    "conflicts": [
+      {"name": "www.a.example.com", "zone": "a.example.com",
+       "current": [{"name": "www.a.example.com", "type": "CNAME", "value": "svc2.b.example.com", "ttl": 60}],
+       "submitted_before": [{"name": "www.a.example.com", "type": "CNAME", "value": "svc.b.example.com", "ttl": 60}]}
+    ]
+  }
+}
+```
+
 ## 测试
 
 ```bash
@@ -178,11 +308,16 @@ pytest
 
 覆盖：安全顺序、必须后发/先发的依赖、现状故障（缺记录 / 成环 / 链出区 /
 链过长 / NODATA vs NXDOMAIN）、无解时的最大前缀与逐区卡点、随机小规模实例与
-穷举结果的等价性校验、请求校验与 HTTP 状态码。
+穷举结果的等价性校验、请求校验与 HTTP 状态码；暂存库的种子载入与重启沿用、
+整单落库/拒收（冲突记录名、区记录校验、故障链）、改前比较忽略顺序、
+整单原子性，以及并发提交下「必保域名可解析」规则不被打破。
 
 ## 限制
 
 * 只支持 A / CNAME；AAAA、SRV、通配符等不参与推演。
-* 最多 8 个区、每区 256 条记录、最多 64 个必保域名。
+* 最多 8 个区、每区 256 条记录、最多 64 个必保域名；每张变更单最多 256 条变更。
 * 同一名称的多条 A 记录视为一个 RRset（多个地址任选其一即视为可解析）。
 * 不校验外部区真实状态；链出已提交区一律按“无法确认”处理。
+* 暂存库的区列表与必保域名只能改种子/快照文件；变更单只改记录。
+* 暂存库按单进程部署（并发安全靠进程内锁 + 原子落盘）；多副本共写同一
+  快照文件不在支持范围内。

@@ -32,6 +32,7 @@ MAX_NAME_LENGTH = 253
 MAX_ZONES = 8
 MAX_RECORDS_PER_ZONE = 256
 MAX_REQUIRED_DOMAINS = 64
+MAX_CHANGES_PER_TICKET = 256
 
 
 def normalize_name(name: str) -> str:
@@ -58,6 +59,78 @@ def zone_covering(name: str, zone_names: list[str]) -> tuple[str, int] | None:
         if in_zone(name, z) and (best is None or len(z) > len(best[0])):
             best = (z, idx)
     return best
+
+
+def check_zone_records(zone_name: str, field: str, records: list["Record"]) -> None:
+    """Validate one zone's record set.
+
+    Shared by ``Zone`` (the /plan request model) and the staging store, so a
+    change ticket is held to exactly the same authoritative-DNS rules as a
+    plan request.  Raises ``ValueError`` on the first violation.
+    """
+    owned: dict[str, tuple[str, set[str]]] = {}
+    for rec in records:
+        if not in_zone(rec.name, zone_name):
+            raise ValueError(
+                f"{field}: {rec.name!r} is not owned by zone {zone_name!r} "
+                "(zones must be self-contained)"
+            )
+        if rec.name == zone_name and rec.type == "CNAME":
+            raise ValueError(
+                f"{field}: CNAME at the zone apex {zone_name!r} is not "
+                "valid in authoritative DNS (the apex holds SOA/NS)"
+            )
+        previous = owned.get(rec.name)
+        if previous is not None and previous[0] != rec.type:
+            raise ValueError(
+                f"{field}: {rec.name!r} has both A and CNAME records, "
+                "which authoritative DNS forbids"
+            )
+        targets = previous[1] if previous else set()
+        if rec.type == "CNAME":
+            targets.add(rec.value)
+            if len(targets) > 1:
+                raise ValueError(
+                    f"{field}: {rec.name!r} has conflicting CNAME targets"
+                )
+        owned[rec.name] = (rec.type, targets)
+
+    # A name holding a CNAME cannot also have names below it.
+    cnames = [n for n, (t, _targets) in owned.items() if t == "CNAME"]
+    for cname in cnames:
+        suffix = "." + cname
+        if any(other != cname and other.endswith(suffix) for other in owned):
+            raise ValueError(
+                f"{field}: {cname!r} is a CNAME but also has names below "
+                "it; authoritative DNS forbids that"
+            )
+
+
+def validate_required_domains(domains: list[str]) -> list[str]:
+    """Normalise and de-dupe the required-domain list."""
+    out = [validate_name(name, "required domain") for name in domains]
+    if len(set(out)) != len(out):
+        raise ValueError("required_domains contains duplicates")
+    return out
+
+
+def check_zone_topology(zone_names: list[str], required_domains: list[str]) -> None:
+    """Zones must be unique and non-nested; domains must be covered."""
+    if len(set(zone_names)) != len(zone_names):
+        raise ValueError("duplicate zone names")
+    for a in zone_names:
+        for b in zone_names:
+            if a != b and in_zone(a, b):
+                raise ValueError(
+                    f"zones must be non-nested: {a!r} is inside {b!r}"
+                )
+    for domain in required_domains:
+        if zone_covering(domain, zone_names) is None:
+            raise ValueError(
+                f"required domain {domain!r} is not inside any submitted "
+                "zone; the planner only has authoritative data for the "
+                "submitted zones"
+            )
 
 
 class Record(BaseModel):
@@ -119,47 +192,9 @@ class Zone(BaseModel):
 
     @model_validator(mode="after")
     def _check_zone_records(self) -> "Zone":
-        self._check_rrset("records", self.records)
-        self._check_rrset("new_records", self.new_records)
+        check_zone_records(self.name, "records", self.records)
+        check_zone_records(self.name, "new_records", self.new_records)
         return self
-
-    def _check_rrset(self, field: str, records: list[Record]) -> None:
-        owned: dict[str, tuple[str, set[str]]] = {}
-        for rec in records:
-            if not in_zone(rec.name, self.name):
-                raise ValueError(
-                    f"{field}: {rec.name!r} is not owned by zone {self.name!r} "
-                    "(zones must be self-contained)"
-                )
-            if rec.name == self.name and rec.type == "CNAME":
-                raise ValueError(
-                    f"{field}: CNAME at the zone apex {self.name!r} is not "
-                    "valid in authoritative DNS (the apex holds SOA/NS)"
-                )
-            previous = owned.get(rec.name)
-            if previous is not None and previous[0] != rec.type:
-                raise ValueError(
-                    f"{field}: {rec.name!r} has both A and CNAME records, "
-                    "which authoritative DNS forbids"
-                )
-            targets = previous[1] if previous else set()
-            if rec.type == "CNAME":
-                targets.add(rec.value)
-                if len(targets) > 1:
-                    raise ValueError(
-                        f"{field}: {rec.name!r} has conflicting CNAME targets"
-                    )
-            owned[rec.name] = (rec.type, targets)
-
-        # A name holding a CNAME cannot also have names below it.
-        cnames = [n for n, (t, _targets) in owned.items() if t == "CNAME"]
-        for cname in cnames:
-            suffix = "." + cname
-            if any(other != cname and other.endswith(suffix) for other in owned):
-                raise ValueError(
-                    f"{field}: {cname!r} is a CNAME but also has names below "
-                    "it; authoritative DNS forbids that"
-                )
 
 
 class PlanRequest(BaseModel):
@@ -171,27 +206,118 @@ class PlanRequest(BaseModel):
     @field_validator("required_domains")
     @classmethod
     def _valid_domains(cls, v: list[str]) -> list[str]:
-        out = [validate_name(name, "required domain") for name in v]
-        if len(set(out)) != len(out):
-            raise ValueError("required_domains contains duplicates")
-        return out
+        return validate_required_domains(v)
 
     @model_validator(mode="after")
     def _check_topology(self) -> "PlanRequest":
-        names = [z.name for z in self.zones]
-        if len(set(names)) != len(names):
-            raise ValueError("duplicate zone names")
-        for a in names:
-            for b in names:
-                if a != b and in_zone(a, b):
+        check_zone_topology([z.name for z in self.zones], self.required_domains)
+        return self
+
+
+# --------------------------------------------------------------------------- #
+# Staging store: snapshot and change tickets
+# --------------------------------------------------------------------------- #
+
+
+class StagedZone(BaseModel):
+    """One authoritative zone as held by the staging store (current records only)."""
+
+    name: str
+    records: list[Record] = Field(default_factory=list, max_length=MAX_RECORDS_PER_ZONE)
+
+    @field_validator("name")
+    @classmethod
+    def _valid_zone(cls, v: str) -> str:
+        return validate_name(v, "zone name")
+
+    @model_validator(mode="after")
+    def _check_records(self) -> "StagedZone":
+        check_zone_records(self.name, "records", self.records)
+        return self
+
+
+class Snapshot(BaseModel):
+    """The persisted staging state: zones, required domains and a revision.
+
+    ``revision`` starts at 0 (seed) and is incremented by every applied
+    ticket, so a duty operator can tell whether the staged state moved.
+    """
+
+    revision: int = Field(default=0, ge=0)
+    zones: list[StagedZone] = Field(min_length=1, max_length=MAX_ZONES)
+    required_domains: list[str] = Field(
+        min_length=1, max_length=MAX_REQUIRED_DOMAINS
+    )
+
+    @field_validator("required_domains")
+    @classmethod
+    def _valid_domains(cls, v: list[str]) -> list[str]:
+        return validate_required_domains(v)
+
+    @model_validator(mode="after")
+    def _check_topology(self) -> "Snapshot":
+        check_zone_topology([z.name for z in self.zones], self.required_domains)
+        return self
+
+
+class RecordSetChange(BaseModel):
+    """Before/after view of the whole RRset at one owner name.
+
+    ``before`` must equal the records currently staged at ``name`` (compared
+    order-insensitively); an empty ``before`` asserts the name does not exist
+    yet.  ``after`` is the desired RRset; an empty ``after`` removes the name.
+    Every record inside either list must be owned by ``name`` itself.
+    """
+
+    name: str
+    before: list[Record] = Field(default_factory=list, max_length=MAX_RECORDS_PER_ZONE)
+    after: list[Record] = Field(default_factory=list, max_length=MAX_RECORDS_PER_ZONE)
+
+    @field_validator("name")
+    @classmethod
+    def _valid_name(cls, v: str) -> str:
+        return validate_name(v, "record name")
+
+    @model_validator(mode="after")
+    def _records_belong_to_name(self) -> "RecordSetChange":
+        for field, records in (("before", self.before), ("after", self.after)):
+            for rec in records:
+                if rec.name != self.name:
                     raise ValueError(
-                        f"zones must be non-nested: {a!r} is inside {b!r}"
+                        f"{field}: record named {rec.name!r} does not belong to "
+                        f"this change, which is for {self.name!r}"
                     )
-        for domain in self.required_domains:
-            if zone_covering(domain, names) is None:
-                raise ValueError(
-                    f"required domain {domain!r} is not inside any submitted "
-                    "zone; the planner only has authoritative data for the "
-                    "submitted zones"
-                )
+        return self
+
+
+class ChangeTicket(BaseModel):
+    """One change ticket: a batch of per-name RRset replacements.
+
+    The ticket is applied to the latest staged snapshot as a whole: every
+    ``before`` must match, the merged zones must pass the same validation as
+    /plan, and every required domain must still resolve to IPv4 afterwards.
+    Otherwise the ticket is rejected and nothing is persisted.
+    """
+
+    ticket_id: str | None = Field(default=None, max_length=128)
+    changes: list[RecordSetChange] = Field(
+        min_length=1, max_length=MAX_CHANGES_PER_TICKET
+    )
+
+    @field_validator("ticket_id")
+    @classmethod
+    def _strip_ticket_id(cls, v: str | None) -> str | None:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                raise ValueError("ticket_id must not be blank")
+        return v
+
+    @model_validator(mode="after")
+    def _unique_change_names(self) -> "ChangeTicket":
+        names = [c.name for c in self.changes]
+        if len(set(names)) != len(names):
+            raise ValueError(
+                "ticket contains more than one change for the same record name"
+            )
         return self

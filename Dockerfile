@@ -13,8 +13,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-# The service is stateless; run it without privileges.
+# The service needs no privileges; run as a system user.
 RUN useradd --system --no-create-home --shell /usr/sbin/nologin appuser
+
+# Staging store: the seed ships in the image; the live snapshot lives on a
+# writable volume so applied tickets survive restarts (root fs is read-only).
+# /data is owned by appuser so a fresh named volume inherits a writable dir.
+ENV STAGING_SEED_PATH=/app/seed/staging-seed.json \
+    STAGING_SNAPSHOT_PATH=/data/staging-snapshot.json
+RUN mkdir -p /data && chown appuser:appuser /data
 USER appuser
 
 EXPOSE 8000

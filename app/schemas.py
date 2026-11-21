@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from .models import StagedZone
+
 
 class TraceStep(BaseModel):
     name: str
@@ -75,3 +77,49 @@ class PlanResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     version: str
+
+
+class SnapshotResponse(BaseModel):
+    """The staged snapshot plus the live resolution state of required domains."""
+
+    revision: int
+    zones: list[StagedZone]
+    required_domains: list[str]
+    all_required_resolvable: bool
+    required_resolution: dict[str, list[str]]
+    unresolved: list[ChainFailure]
+
+
+class TicketAppliedResponse(BaseModel):
+    """Returned when a change ticket passed all checks and was persisted."""
+
+    status: Literal["applied"]
+    ticket_id: str | None
+    revision: int
+    applied_changes: list[str]
+    snapshot: SnapshotResponse
+
+
+class RejectionDetail(BaseModel):
+    """Body of ``detail`` for rejected tickets (HTTP 409 / 422)."""
+
+    status: Literal["rejected"]
+    reason: Literal[
+        "before_mismatch",
+        "name_outside_zones",
+        "zone_validation_failed",
+        "required_domains_unresolvable",
+    ]
+    message: str
+    conflicting_names: list[str] = Field(default_factory=list)
+    conflicts: list[dict] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    fault_chains: list[ChainFailure] = Field(default_factory=list)
+
+    model_config = {"extra": "allow"}
+
+
+class RejectionResponse(BaseModel):
+    """HTTP error envelope for rejected tickets."""
+
+    detail: RejectionDetail

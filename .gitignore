@@ -4,3 +4,5 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+# 本地运行时暂存库快照（docker 部署在命名卷里）
+data/

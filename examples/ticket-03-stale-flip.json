@@ -1,0 +1,14 @@
+{
+  "ticket_id": "CHG-1003",
+  "changes": [
+    {
+      "name": "www.a.example.com",
+      "before": [
+        {"name": "www.a.example.com", "type": "CNAME", "value": "svc.b.example.com", "ttl": 60}
+      ],
+      "after": [
+        {"name": "www.a.example.com", "type": "A", "value": "10.20.9.9", "ttl": 60}
+      ]
+    }
+  ]
+}

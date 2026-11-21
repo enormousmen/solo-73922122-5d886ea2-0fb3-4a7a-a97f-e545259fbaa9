@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .models import PlanRequest
+from .models import PlanRequest, Snapshot, Zone
 from .planner import CandidateBlock, plan_order
 from .resolver import Resolution, Resolver
 
@@ -22,7 +22,7 @@ STATUS_MEANINGS = {
 }
 
 
-def _resolution_json(res: Resolution) -> dict[str, Any]:
+def resolution_json(res: Resolution) -> dict[str, Any]:
     return {
         "domain": res.domain,
         "resolved": res.ok,
@@ -96,7 +96,7 @@ def _blocked_candidate_json(block: CandidateBlock) -> dict[str, Any]:
         "categories": [
             {"category": c, "label": CATEGORY_LABELS[c]} for c in block.categories
         ],
-        "failures": [_resolution_json(f) for f in block.failures],
+        "failures": [resolution_json(f) for f in block.failures],
     }
 
 
@@ -131,7 +131,7 @@ def build_plan(request: PlanRequest) -> dict[str, Any]:
             "order": [],
             "safe_prefix": [],
             "steps": [],
-            "fault_chains": [_resolution_json(f) for f in initial_failures],
+            "fault_chains": [resolution_json(f) for f in initial_failures],
             "blocked_zones": [],
             "failure_summary": _failure_summary(initial_failures),
         }
@@ -186,4 +186,22 @@ def build_plan(request: PlanRequest) -> dict[str, Any]:
         "fault_chains": [],
         "blocked_zones": blocked,
         "failure_summary": _failure_summary(blocked_failures),
+    }
+
+
+def snapshot_resolution(snapshot: Snapshot) -> dict[str, Any]:
+    """Resolve the snapshot's required domains against its current records.
+
+    Uses the same cache-less authoritative resolver as /plan: every zone is
+    evaluated exactly as staged, with no TTL or caching effects.
+    """
+    zones = [
+        Zone(name=z.name, records=z.records, new_records=z.records)
+        for z in snapshot.zones
+    ]
+    results = Resolver(zones).resolve_all(snapshot.required_domains, frozenset())
+    return {
+        "all_required_resolvable": all(r.ok for r in results),
+        "required_resolution": {r.domain: r.addresses for r in results if r.ok},
+        "unresolved": [resolution_json(r) for r in results if not r.ok],
     }

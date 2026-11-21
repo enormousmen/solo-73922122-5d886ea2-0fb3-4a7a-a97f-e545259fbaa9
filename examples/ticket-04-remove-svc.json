@@ -1,0 +1,12 @@
+{
+  "ticket_id": "CHG-1004",
+  "changes": [
+    {
+      "name": "svc.b.example.com",
+      "before": [
+        {"name": "svc.b.example.com", "type": "A", "value": "10.20.1.10", "ttl": 60}
+      ],
+      "after": []
+    }
+  ]
+}
